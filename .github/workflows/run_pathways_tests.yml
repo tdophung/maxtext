@@ -50,6 +50,9 @@ on:
       cloud_runner:
         required: false
         type: string
+      maxtext_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -67,7 +70,10 @@ jobs:
         JAX_BACKEND_TARGET: "grpc://localhost:29000"
       options: ${{ inputs.container_resource_option }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout MaxText
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.maxtext_sha }}
       - name: Download the maxtext wheel
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -92,12 +98,13 @@ jobs:
             FINAL_PYTEST_MARKER="${{ inputs.pytest_marker }} and not scheduled_only"
           fi
           export MAXTEXT_REPO_ROOT=$(pwd)
-          export MAXTEXT_ASSETS_ROOT=$(pwd)/src/MaxText/assets
+          export MAXTEXT_ASSETS_ROOT=$(pwd)/src/maxtext/assets
           export MAXTEXT_TEST_ASSETS_ROOT=$(pwd)/tests/assets
           export MAXTEXT_PKG_DIR=$(pwd)/src/MaxText
           # TODO(b/454659463): Enable test_default_hlo_match after volume mount is supported.
           .venv/bin/python3 -m pytest ${{ inputs.pytest_addopts }} -v -m "${FINAL_PYTEST_MARKER}" -k "not AotHloIdenticalTest and not CompileThenLoad" --durations=0
-    
+        env:
+          PYTHONPATH: "${{ github.workspace }}/src"
     services:
       resource_manager:
         image: us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:latest

@@ -25,12 +25,12 @@ import jax.numpy as jnp
 
 import omegaconf
 
-from MaxText import max_utils
 from MaxText import pyconfig_deprecated
 from MaxText.common_types import DecoderBlockType, ShardMode
 from MaxText.configs import types
 from MaxText.configs.types import MaxTextConfig
-from MaxText.inference_utils import str2bool
+from maxtext.inference.inference_utils import str2bool
+from maxtext.utils import max_utils
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOGLEVEL", "INFO"))
@@ -201,12 +201,6 @@ def initialize(argv: list[str], **kwargs) -> HyperParameters:
   """Initializes the configuration by loading YAML files, and applying CLI, env, and kwarg overrides."""
   pydantic_config = initialize_pydantic(argv, **kwargs)
   config = HyperParameters(pydantic_config)
-
-  if config.log_config:
-    for k, v in sorted(config.get_keys().items()):
-      if k != "hf_access_token":
-        logger.info("Config param %s: %s", k, v)
-
   return config
 
 

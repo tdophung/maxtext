@@ -36,15 +36,15 @@ from flax.linen import partitioning as nn_partitioning
 
 from MaxText import accelerator_to_spec_map
 from MaxText import train
-from MaxText import maxtext_utils
 from MaxText import optimizers
-from MaxText import max_utils
 from MaxText import pyconfig
 from MaxText import sharding
 from MaxText.common_types import MODEL_MODE_TRAIN, ShardMode
 from MaxText.layers import models
 from MaxText.layers import quantizations
-from MaxText.utils import gcs_utils
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_utils
+from maxtext.utils import maxtext_utils
 
 # pylint: disable=too-many-positional-arguments
 
@@ -104,12 +104,15 @@ def get_shaped_inputs(topology_mesh, config):
       model, tx, config, example_rng, topology_mesh
   )
 
+  # unsharded logical annotations
+  logical_annotations = maxtext_utils.get_logical_annotations(model, tx, config, example_rng, topology_mesh)
+
   # Shaped batch
   shaped_batch = maxtext_utils.get_shaped_batch(config)
 
   shaped_train_args = (abstract_state, shaped_batch, shaped_rng)
   shaped_train_kwargs = {}
-  return shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model
+  return shaped_train_args, shaped_train_kwargs, state_mesh_shardings, logical_annotations, model
 
 
 def jit_and_compile(
@@ -121,6 +124,7 @@ def jit_and_compile(
     out_shardings,
     static_argnums,
     donate_argnums,
+    config,
     logical_axis_rules,
 ):
   """Jit, lower, and compile func."""
@@ -132,6 +136,7 @@ def jit_and_compile(
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
+    maxtext_utils.maybe_dump_jaxpr(config, jitted, func_input_args)
     lowered = jitted.lower(*func_input_args, **func_input_kwargs)
   compiled = lowered.compile()
   return compiled
@@ -158,7 +163,13 @@ def is_oom(argv: Sequence[str]) -> bool:
   max_utils.print_system_information()
 
   # Get shaped inputs
-  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(topology_mesh, config)
+  (
+      shaped_train_args,
+      shaped_train_kwargs,
+      state_mesh_shardings,
+      _,
+      model,
+  ) = get_shaped_inputs(topology_mesh, config)
 
   # Get data sharding
   data_sharding = sharding.get_input_data_sharding(config, topology_mesh)
@@ -180,6 +191,7 @@ def is_oom(argv: Sequence[str]) -> bool:
         out_shard,
         static_argnums,
         donate_argnums,
+        config,
         nn_partitioning.axis_rules(config.logical_axis_rules),
     )
     return False
@@ -213,7 +225,13 @@ def main(argv: Sequence[str]) -> None:
   max_utils.print_system_information()
 
   # Get shaped inputs
-  shaped_train_args, shaped_train_kwargs, state_mesh_shardings, model = get_shaped_inputs(topology_mesh, config)
+  (
+      shaped_train_args,
+      shaped_train_kwargs,
+      state_mesh_shardings,
+      logical_annotations,
+      model,
+  ) = get_shaped_inputs(topology_mesh, config)
 
   # Get data sharding
   data_sharding = sharding.get_input_data_sharding(config, topology_mesh)
@@ -228,7 +246,12 @@ def main(argv: Sequence[str]) -> None:
   # print weights sharding info under debug sharding mode
   if config.debug_sharding:
     max_utils.print_non_trivial_mesh_axis(topology_mesh)
-    maxtext_utils.print_state_mesh_shardings_params(shaped_train_args[0], state_mesh_shardings, topology_mesh)
+    maxtext_utils.print_shardings_params(
+        shaped_train_args[0].params,
+        state_mesh_shardings.params,
+        topology_mesh,
+        logical_annotations.params,
+    )
 
   # Compile
   print("Jitting and compiling train step...", flush=True)
@@ -241,6 +264,7 @@ def main(argv: Sequence[str]) -> None:
       out_shard,
       static_argnums,
       donate_argnums,
+      config,
       nn_partitioning.axis_rules(config.logical_axis_rules),
   )
   print("Jitting and compilation complete!", flush=True)

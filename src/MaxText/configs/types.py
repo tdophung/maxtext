@@ -33,9 +33,11 @@ from pydantic.functional_validators import model_validator, field_validator
 from pydantic.main import BaseModel
 from pydantic.types import PositiveInt, NonNegativeFloat, NonNegativeInt
 
-from MaxText import accelerator_to_spec_map, max_utils
+from MaxText import accelerator_to_spec_map
 from MaxText.common_types import AttentionType, DecoderBlockType, ShardMode
 from MaxText.globals import MAXTEXT_ASSETS_ROOT
+from maxtext.utils import gcs_utils
+from maxtext.utils import max_utils
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ class QuantizationType(str, Enum):
   TE_FP8_CS = "te_fp8_currentscaling"
   TE_MXFP8 = "te_mxfp8"
   TE_NVFP4 = "te_nvfp4"
+  TE_NVFP4_NO_RHT = "te_nvfp4_no_rht"
 
 
 class KvQuantAxis(str, Enum):
@@ -186,7 +189,7 @@ class ProfilerType(str, Enum):
 # Pydantic models for configuration
 # ----------------------------------------------------------------------------
 
-type ModelName = Literal[
+ModelName = Literal[
     "default",
     "llama2-7b",
     "llama2-13b",
@@ -206,6 +209,8 @@ type ModelName = Literal[
     "deepseek3-671b-2dfsdp",
     "deepseek3-test",
     "deepseek3-tiny",
+    "deepseek3.2-671b",
+    "deepseek-custom",
     "kimi-k2-1t",
     "gemma-7b",
     "gemma-2b",
@@ -234,6 +239,8 @@ type ModelName = Literal[
     "gpt-oss-120b",
     "llama4-17b-16e",
     "llama4-17b-128e",
+    "olmo3_7b",
+    "olmo3_32b",
 ]
 
 
@@ -479,6 +486,7 @@ class Attention(BaseModel):
   enable_padding_causal_mask: bool = Field(True, description="Temporary flag for TE padding.")
   use_tokamax_splash: bool = Field(False, description="Whether to use tokamax splash attention.")
   use_jax_splash: bool = Field(False, description="Whether to use jax splash attention.")
+  force_q_layout: bool = Field(False, description="Force the Q layout")
 
 
 class MoBa(BaseModel):
@@ -498,6 +506,15 @@ class MlaAttention(BaseModel):
   qk_nope_head_dim: NonNegativeInt = Field(128, description="Dimension for non-RoPE part of QK heads in MLA.")
   qk_rope_head_dim: NonNegativeInt = Field(64, description="Dimension for RoPE part of QK heads in MLA.")
   v_head_dim: NonNegativeInt = Field(128, description="Dimension of V heads in MLA.")
+
+
+class AttentionIndexer(BaseModel):
+  """Configuration for DeepSeek Sparse Attention (DSA): DeepSeek3.2-style MLA with indexer."""
+
+  use_sparse_indexer: bool = Field(False, description="Whether to use sparse indexer for MLA.")
+  index_head_dim: NonNegativeInt = Field(128, description="Head dim for indexer query and key.")
+  index_n_heads: NonNegativeInt = Field(64, description="Number of query heads in indexer.")
+  index_topk: NonNegativeInt = Field(2048, description="Number of tokens selected by the query token in indexer.")
 
 
 class Llama4Attention(BaseModel):
@@ -546,6 +563,7 @@ class SplashAttention(BaseModel):
       0,
       description="the number of reduction steps. For now, only 3 or all the kv steps are supported.",
   )
+  use_splash_scheduler: bool = Field(False, description="Use experimental splash attention scheduler.")
 
 
 class PagedAttention(BaseModel):
@@ -653,6 +671,13 @@ class MoEKernels(BaseModel):
   wo_tile_drhs_embed_dim: int = Field(1024, description="bwd pass drhs tiling dimension for embedding in GMM for wo.")
   wo_tile_drhs_mlp_dim: int = Field(1024, description="bwd pass drhs tiling dimension for MLP in GMM for wo.")
 
+  wi_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wi.")
+  wi_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wi.")
+  wi_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wi.")
+  wo_tile_fwd_buffer_count: int = Field(2, description="forward pass tiling buffer count in GMM for wo.")
+  wo_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wo.")
+  wo_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wo.")
+
 
 class DeepSeekMoE(BaseModel):
   """Configuration specific to DeepSeek-style MoE layers."""
@@ -674,6 +699,10 @@ class DeepSeekMoE(BaseModel):
   use_batch_split_schedule: bool = Field(
       False,
       description="Whether to split batch into micro-batches to hide communications that yields performance benefits.",
+  )
+  batch_split_factor: int = Field(
+      1,
+      description="Factor by which to split the batch into micro-batches. Only used if use_batch_split_schedule is True.",
   )
 
 
@@ -855,6 +884,11 @@ class RematAndOffload(BaseModel):
       RematLocation.REMAT,
       description="Remat policy for the mla's key and value projection.",
   )
+  attention_out: RematLocation = Field(
+      RematLocation.REMAT,
+      description="Remat policy for the attention output.",
+  )
+
   optimizer_memory_host_offload: bool = Field(False, description="Offload optimizer state to host memory.")
   parameter_memory_host_offload: bool = Field(False, description="Offload parameters to host memory.")
 
@@ -864,7 +898,7 @@ class Tokenizer(BaseModel):
 
   vocab_size: int = Field(32_000, description="The size of the vocabulary.")
   tokenizer_path: PathStr = Field(
-      os.path.join("assets", "tokenizer.llama2"),
+      os.path.join("assets", "tokenizers", "tokenizer.llama2"),
       description="Path to the tokenizer model file.",
   )
   tokenizer_type: TokenizerType = Field(TokenizerType.SENTENCEPIECE, description="The type of tokenizer.")
@@ -1041,12 +1075,23 @@ class TrainingLoop(BaseModel):
   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
 
 
+class ManifoldConstrainedHyperConnections(BaseModel):
+  """Configuration for DeepSeek Manifold-Constrained Hyper Connections (mHC)."""
+
+  mhc_expansion_rate: int = Field(0, description="The number of parallel streams in Hyper Connection.")
+  sinkhorn_iterations: PositiveInt = Field(20, description="The number of iterations for the Sinkhorn-Knopp algorithm.")
+
+
 class Optimizer(BaseModel):
   """Configuration for the optimizer and learning rate schedule."""
 
   opt_type: OptimizerType = Field(OptimizerType.ADAMW, description="The type of optimizer to use.")
   gradient_accumulation_steps: PositiveInt = Field(
       1, description="Number of steps to accumulate gradients before updating."
+  )
+  use_tunix_gradient_accumulation: bool = Field(
+      False,
+      description="Whether to use the Tunix implementation for gradient accumulation.",
   )
   gradient_clipping_threshold: NonNegativeFloat = Field(
       1.0, description="The threshold for gradient clipping. 0 disables clipping."
@@ -1296,6 +1341,13 @@ class HloDump(BaseModel):
   dump_hlo_local_module_name: str = Field("jit_train_step", description="Filter modules to save locally by this name.")
   dump_hlo_xla_flags: str = Field("", description="Pass custom XLA flags for HLO dumping.")
   dump_hlo_upload_all: bool = Field(False, description="Upload HLO from all hosts.")
+  dump_jaxpr: bool = Field(False, description="Enable jaxpr dumping.")
+  dump_jaxpr_local_dir: PathStr = Field(
+      os.path.join(gettempdir(), "jaxpr_dump", ""),
+      description="Local directory to dump jaxpr.",
+  )
+  dump_jaxpr_delete_local_after: bool = Field(True, description="Delete local jaxpr dump after uploading to GCS.")
+  dump_jaxpr_gcs_dir: PathStr = Field("", description="GCS directory to upload jaxpr dumps.")
 
 
 class StackTrace(BaseModel):
@@ -1367,6 +1419,8 @@ class MultimodalGeneral(BaseModel):
 
   use_multimodal: bool = Field(False, description="Enable multimodal capabilities.")
   freeze_vision_encoder_params: bool = Field(True, description="Freeze the parameters of the vision encoder.")
+  freeze_audio_encoder_params: bool = Field(True, description="Freeze the parameters of the audio encoder.")
+  use_audio: bool = Field(False, description="Enable audio encoder for multimodal models.")
   image_size_for_vit: int = Field(896, description="Input image size for the Vision Transformer.")
   image_path: PathStr = Field("", description="Path to an image for decoding.")
   image_placeholder: str = Field("<|image|>", description="Placeholder string for images in text prompts.")
@@ -1378,6 +1432,9 @@ class MultimodalGeneral(BaseModel):
   video_path: PathStr = Field("", description="Path to a video for decoding.")
   audio_path: PathStr = Field("", description="Path to an audio file for decoding.")
   use_audio_in_video: bool = Field(False, description="Extract and use audio from video files.")
+  use_mrope: bool = Field(False, description="Enable Multi-dimensional RoPE for Qwen3-Omni models.")
+  mrope_section: list[int] = Field([24, 20, 20], description="Dimensions for temporal, height, width in MRoPE.")
+  position_id_per_seconds: int = Field(25, description="Temporal granularity for MRoPE (tokens per second).")
 
 
 class VisionTower(BaseModel):
@@ -1415,6 +1472,29 @@ class VisionProjector(BaseModel):
   projector_dropout_for_vit: float = Field(0.0, description="Dropout rate for the vision projector.")
 
 
+class AudioEncoder(BaseModel):
+  """Configuration for the Audio Encoder in a multimodal model."""
+
+  d_model_for_audio: int = Field(256, description="Model dimension for the audio encoder.")
+  encoder_attention_heads_for_audio: int = Field(4, description="Number of attention heads in the audio encoder.")
+  encoder_ffn_dim_for_audio: int = Field(512, description="Feed-forward network dimension for the audio encoder.")
+  encoder_layers_for_audio: int = Field(2, description="Number of encoder layers for audio.")
+  attention_dropout_for_audio: float = Field(0.0, description="Attention dropout rate for audio encoder.")
+  activation_dropout_for_audio: float = Field(0.0, description="Activation dropout rate for audio encoder.")
+  activation_function_for_audio: str = Field("gelu", description="Activation function for audio encoder.")
+  num_mel_bins_for_audio: int = Field(128, description="Number of mel-frequency bins for audio input.")
+  max_source_positions_for_audio: int = Field(1500, description="Maximum source positions for audio encoder.")
+  scale_embedding_for_audio: bool = Field(True, description="Whether to scale embeddings in audio encoder.")
+  n_window_for_audio: int = Field(50, description="Window size for audio processing.")
+  n_window_infer_for_audio: int = Field(800, description="Window size for audio inference.")
+  conv_chunksize_for_audio: int = Field(500, description="Chunk size for convolutional layers in audio encoder.")
+  downsample_hidden_size_for_audio: int = Field(256, description="Hidden size for downsampling in audio encoder.")
+  output_dim_for_audio: int = Field(512, description="Output dimension for audio encoder.")
+  num_conv_layers_for_audio: int = Field(3, description="Number of convolutional layers in audio encoder.")
+  max_timescale_for_audio: float = Field(10000.0, description="Maximum timescale for audio positional encoding.")
+  max_sample_len_for_audio: int = Field(10000, description="Maximum sample length for audio input.")
+
+
 class Debug(BaseModel):
   """Configuration for debugging options."""
 
@@ -1446,6 +1526,9 @@ class VLLM(BaseModel):
   kv_cache_buffer: int = Field(256, description="Buffer for KV cache.")
   hbm_utilization_vllm: float = Field(0.72, description="Target HBM utilization for vLLM.")
   swap_space_vllm_gb: int = Field(2, description="Swap space in GB for vLLM.")
+  enable_dp_attention: bool = Field(False, description="Enable the attn_dp mesh axis in vLLM.")
+  max_num_batched_tokens: Optional[int] = Field(None, description="Max number of batched tokens in vLLM.")
+  max_num_seqs: Optional[int] = Field(None, description="Max number of sequences in vLLM.")
   vllm_additional_config: dict[str, Any] = Field(default_factory=dict, description="Additional vLLM config options.")
   vllm_hf_config_path: str = Field("", description="Path to HuggingFace model config for MaxText model.")
 
@@ -1667,6 +1750,7 @@ class MaxTextConfig(
     Attention,
     MlaAttention,
     MoBa,
+    AttentionIndexer,
     Llama4Attention,
     SplashAttention,
     PagedAttention,
@@ -1684,6 +1768,7 @@ class MaxTextConfig(
     # Training, Optimization, and Fine-Tuning
     RematAndOffload,
     TrainingLoop,
+    ManifoldConstrainedHyperConnections,
     Optimizer,
     AdamW,
     Muon,
@@ -1729,6 +1814,7 @@ class MaxTextConfig(
     MultimodalGeneral,
     VisionTower,
     VisionProjector,
+    AudioEncoder,
     # Derived
     DerivedValues,
 ):
@@ -1791,8 +1877,8 @@ class MaxTextConfig(
           filter(
               os.path.exists,
               (
-                  os.path.join(MAXTEXT_ASSETS_ROOT, os.path.basename(tokenizer_path)),
-                  os.path.join(MAXTEXT_ASSETS_ROOT, tokenizer_path),
+                  os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", os.path.basename(tokenizer_path)),
+                  os.path.join(MAXTEXT_ASSETS_ROOT, "tokenizers", tokenizer_path),
               ),
           ),
           tokenizer_path,
@@ -1828,6 +1914,33 @@ class MaxTextConfig(
       self.attn_logits_soft_cap = None
     if self.final_logits_soft_cap == 0.0:
       self.final_logits_soft_cap = None
+
+    # This must be invoked before initializing the backend
+    # pylint: disable=access-member-before-definition
+    def validate_and_set_hlo_dump_defaults():
+      if os.environ.get("XLA_FLAGS") and self.dump_hlo_xla_flags:
+        raise ValueError("You must set either XLA_FLAGS or dump_hlo_xla_flags to dump HLO, but not both.")
+      if not os.environ.get("XLA_FLAGS") and not self.dump_hlo_xla_flags:
+        self.dump_hlo_xla_flags = f"--xla_dump_to={self.dump_hlo_local_dir} --xla_dump_large_constants"
+        if self.dump_hlo_local_module_name:
+          self.dump_hlo_xla_flags = (
+              f"{self.dump_hlo_xla_flags} --xla_dump_hlo_module_re={self.dump_hlo_local_module_name}"
+          )
+      if not self.dump_hlo_gcs_dir:
+        self.dump_hlo_gcs_dir = os.path.join(self.base_output_directory, self.run_name, "xla_dump")
+      else:
+        self.dump_hlo_gcs_dir = gcs_utils.add_trailing_slash(self.dump_hlo_gcs_dir)
+      if not self.dump_jaxpr_gcs_dir:
+        self.dump_jaxpr_gcs_dir = os.path.join(self.base_output_directory, self.run_name, "jaxpr_dump")
+      else:
+        self.dump_jaxpr_gcs_dir = gcs_utils.add_trailing_slash(self.dump_jaxpr_gcs_dir)
+      if not os.environ.get("XLA_FLAGS"):
+        os.environ["XLA_FLAGS"] = self.dump_hlo_xla_flags
+
+    # pylint: enable=access-member-before-definition
+
+    # Validate and initiate hlo dump related configs
+    validate_and_set_hlo_dump_defaults()
 
     # D. CALCULATE MODEL DIMENSIONS from global_parameter_scale
     # This allows scaling the model size up or down easily with a single power-of-two factor.
@@ -1964,6 +2077,7 @@ class MaxTextConfig(
           "mla_kv",
           "mla_q",
           "qkv_proj",
+          "attention_out",
           "out_proj",
       ]
       self.tensors_on_device = [t for t in tensors if getattr(self, t) == "device"]
@@ -2077,6 +2191,11 @@ class MaxTextConfig(
         raise ValueError("`local_checkpoint_period` must be > 0 for emergency checkpointing.")
     if self.moba and self.attention not in ("dot_product"):
       raise ValueError("MoBA is only supported with dot_product attention.")
+    if self.use_sparse_indexer:
+      if self.q_lora_rank == 0:
+        raise NotImplementedError("Sparse indexer has not implemented for q_lora_rank = 0.")
+      if self.attention not in ("dot_product"):
+        raise ValueError("Sparse indexer is only supported dot_product attention")
     if self.attention_type == AttentionType.CHUNK.value and (
         not isinstance(self.chunk_attn_window_size, int) or self.chunk_attn_window_size <= 0
     ):
@@ -2197,10 +2316,34 @@ class MaxTextConfig(
     ):
       logger.warning("`tokenizer_type` is not 'tiktoken' when using llama3 tokenizer. Overriding to 'tiktoken'.")
       self.tokenizer_type = TokenizerType.TIKTOKEN
+    # Data input validations
+    if self.dataset_type == DatasetType.HF:
+      if not self.hf_path:
+        raise ValueError("hf_path can't be empty when dataset_type=hf")
+      if self.hf_eval_files:
+        self.hf_eval_split = "train"
+      if self.eval_interval > 0 and not self.hf_eval_split:
+        raise ValueError("Please specify hf_eval_split or set eval_interval to <=0.")
+    elif self.dataset_type == DatasetType.GRAIN:
+      if not self.grain_train_files and not self.grain_train_mixture_config_path:
+        raise ValueError("When dataset_type=grain, please set grain_train_files or grain_train_mixture_config_path")
+      if self.eval_interval > 0 and not self.grain_eval_files:
+        raise ValueError("Please specify grain_eval_files or set eval_interval to <=0.")
+      if self.tokenizer_type not in (TokenizerType.SENTENCEPIECE, TokenizerType.HUGGINGFACE):
+        raise ValueError(
+            f"grain pipeline only supports tokenizer_type: sentencepiece, huggingface, but got {self.tokenizer_type}"
+        )
+    elif self.dataset_type == DatasetType.TFDS:
+      if not self.dataset_name:
+        raise ValueError("dataset_name can't be empty when dataset_type=tfds")
+      if self.eval_interval > 0 and not self.eval_split:
+        raise ValueError("Please specify eval_split or set eval_interval to <=0.")
+
+    if self.sharding_tolerance > 1.0 or self.sharding_tolerance < 0.0:
+      logger.warning("'sharding_tolerance: allowed percentage of non-sharded parameters' should be between 0.0 and 1.0")
+
     if self.eval_interval > 0 >= self.eval_steps and self.generate_padding_batch_eval:
       raise ValueError("`eval_steps` must be > 0 when `generate_padding_batch_eval` is True.")
-    if self.dataset_type == "hf" and self.num_epoch != 1:
-      raise ValueError("HuggingFace pipeline only supports num_epoch=1.")
     if self.rl.loss_algo == "grpo":
       self.use_grpo = True
     else:
@@ -2215,6 +2358,8 @@ class MaxTextConfig(
           "Muon dimension numbers haven't been tested for this model. Run this command first: "
           f"`python3 -m MaxText.muon_utils {self.model_name} True`"
       )
+    if self.force_q_layout and not self.use_jax_splash:
+      raise ValueError("`force_q_layout` can only be true if `use_jax_splash` is also true.")
 
     # I. FINAL TYPE CONVERSIONS AND DERIVED LISTS
     # Create the ici_parallelism and dcn_parallelism lists for legacy compatibility.
@@ -2262,6 +2407,7 @@ class MaxTextConfig(
           "model": self.ici_tensor_parallelism,
           "expert": self.ici_expert_parallelism,
           "autoregressive": self.ici_autoregressive_parallelism,
+          "attn_dp": 1,  # initialized to 1, vLLM will auto calculate this value based on TP and num_kv_heads
       }
       self.ici_parallelism = [ici_map[axis] for axis in self.mesh_axes]
 
@@ -2279,6 +2425,7 @@ class MaxTextConfig(
           "model": self.dcn_tensor_parallelism,
           "expert": self.dcn_expert_parallelism,
           "autoregressive": self.dcn_autoregressive_parallelism,
+          "attn_dp": 1,  # initialized to 1, vLLM will auto calculate this value based on TP and num_kv_heads
       }
       self.dcn_parallelism = [dcn_map[axis] for axis in self.mesh_axes]
 

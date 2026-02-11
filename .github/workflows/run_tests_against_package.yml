@@ -58,6 +58,9 @@ on:
         required: false
         type: number
         default: 1
+      maxtext_sha:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -74,7 +77,10 @@ jobs:
         ALLOW_MULTIPLE_LIBTPU_LOAD: ${{ inputs.device_type == 'cpu' && 'true' || '' }} # bypass /tmp/libtpu_lockfile check for cpu tests, which don't actually use accelerators (to allow concurrency)
       options: ${{ inputs.container_resource_option }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout MaxText
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.maxtext_sha }}
       - name: Download the maxtext wheel
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
@@ -102,7 +108,7 @@ jobs:
           fi
           # TODO: Use package data for testing and remove the env vars
           export MAXTEXT_REPO_ROOT=$(pwd)
-          export MAXTEXT_ASSETS_ROOT=$(pwd)/src/MaxText/assets
+          export MAXTEXT_ASSETS_ROOT=$(pwd)/src/maxtext/assets
           export MAXTEXT_TEST_ASSETS_ROOT=$(pwd)/tests/assets
           export MAXTEXT_PKG_DIR=$(pwd)/src/MaxText
           # omit this libtpu init args for gpu tests
@@ -120,8 +126,9 @@ jobs:
             -v \
             -m "${FINAL_PYTEST_MARKER}" \
             --durations=0 \
-            --deselect "tests/tokenizer_test.py::TokenizerTest::test_detokenize" \
+            --deselect "tests/unit/tokenizer_test.py::TokenizerTest::test_detokenize" \
             --cov=MaxText \
+            --cov=maxtext \
             --cov-report=xml \
             --cov-report=term \
             $SPLIT_ARGS

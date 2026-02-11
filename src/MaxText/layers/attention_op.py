@@ -32,7 +32,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ke
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
-from MaxText import max_utils
 from MaxText.common_types import (
     Array,
     AttentionType,
@@ -69,15 +68,16 @@ from MaxText.common_types import (
     Q_LENGTH,
     Q_LENGTH_NO_EXP,
 )
-from MaxText.inference import page_manager
-from MaxText.inference.kvcache import KVQuant, KVTensor
-from MaxText.kernels import jax_flash_attention
-from MaxText.kernels.ragged_attention import ragged_gqa
-from MaxText.kernels.ragged_attention import ragged_mha
 from MaxText.layers import nnx_wrappers
 from MaxText.layers.initializers import variable_to_logically_partitioned
 from MaxText.layers.quantizations import AqtQuantization as Quant
 from MaxText.sharding import logical_to_mesh_axes, maybe_shard_with_name
+from maxtext.inference import page_manager
+from maxtext.inference.kvcache import KVQuant, KVTensor
+from maxtext.kernels.attention import jax_flash_attention
+from maxtext.kernels.attention.ragged_attention import ragged_gqa
+from maxtext.kernels.attention.ragged_attention import ragged_mha
+from maxtext.utils import max_utils
 import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_kernel as tokamax_splash_kernel
 from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as tokamax_splash_mask
@@ -149,11 +149,9 @@ class ChunkedCausalMask(splash_attention_mask._ComputableMask):  # pylint: disab
   This mask class inherits from splash_attention_mask._ComputableMask and is designed to be used with Splash Attention.
   It allows the mask logic to be computed on-the-fly or fused into the attention kernel, avoiding the memory cost of
   materializing the full (sequence_length, sequence_length) boolean mask array, which can be prohibitive for long sequences.
-
-  Attributes:
-    chunk_size: The size of each attention chunk.
   """
 
+  #: The size of each attention chunk.
   chunk_size: int
 
   def __init__(
@@ -606,12 +604,14 @@ class AttentionOp(nnx.Module):
           logical OR.
 
     Returns:
-      An `Array` representing the attention mask, broadcastable to the shape
-      `[batch_size, num_heads, q_sequence_length, kv_sequence_length]`.
+      An `Array` representing the attention mask, with shape
+       `[batch_size, 1, 1, q_sequence_length, kv_sequence_length]`.
+      It is broadcastable to the shape
+       `[batch_size, num_kv_heads, group_size=n_q // n_kv, q_sequence_length, kv_sequence_length]`.
       Positions with `0.0` allow attention, while positions with
-      `DEFAULT_MASK_VALUE` (a large negative number) prevent it.
+       `DEFAULT_MASK_VALUE` (a large negative number) prevent it.
       Returns `None` if no masking is determined to be necessary based on
-      the inputs and configuration.
+       the inputs and configuration.
 
     References:
       [1] JAX Pallas MHA Flash Attention:
@@ -824,6 +824,7 @@ class AttentionOp(nnx.Module):
       previous_chunk: Any = None,
       bidirectional_mask: Any = None,
       sinks: Array | None = None,
+      index_mask: Array | None = None,
       *,
       qk_product_einsum: Callable[..., Array],
       wv_product_einsum: Callable[..., Array],
@@ -863,6 +864,7 @@ class AttentionOp(nnx.Module):
           previous_chunk,
           bidirectional_mask=bidirectional_mask,
           sinks=sinks,
+          index_mask=index_mask,
           qk_product_einsum=qk_product_einsum,
           wv_product_einsum=wv_product_einsum,
       )
@@ -1120,6 +1122,7 @@ class AttentionOp(nnx.Module):
             if config.cost_estimate_flops_bwd >= 0
             else None,
             dq_reduction_steps=config.dq_reduction_steps if config.dq_reduction_steps > 0 else None,
+            use_experimental_scheduler=config.use_splash_scheduler,
         )
       else:
         sa_config = splash_attention_kernel.BlockSizes(
@@ -1561,6 +1564,7 @@ class AttentionOp(nnx.Module):
       previous_chunk: Any = None,
       bidirectional_mask: Any = None,
       sinks: Array | None = None,
+      index_mask: Array | None = None,
       *,
       qk_product_einsum: Callable[..., Array],
       wv_product_einsum: Callable[..., Array],
@@ -1614,6 +1618,7 @@ class AttentionOp(nnx.Module):
     attn_mask = self.generate_attention_mask(
         query, key, decoder_segment_ids, model_mode, previous_chunk, bidirectional_mask
     )
+
     if self.config.moba:
       kv_seq_len = key.shape[1]
       # This logic for `next_pos` is duplicated from `generate_attention_mask`.
@@ -1630,6 +1635,13 @@ class AttentionOp(nnx.Module):
       # is scale-invariant, we can use the scaled query directly.
       moba_mask = self._generate_moba_mask(query, key, q_positions)
       attn_weights += moba_mask
+
+    # Apply index mask, deepseek sparse attention
+    # index mask contains 0.0 for kept tokens and large negative for masked tokens.
+    if index_mask is not None:
+      # attn_weights: [b, n_kv, n_q // n_kv, q_len, kv_len]
+      # index_mask: [b, 1, 1, q_len, kv_len]
+      attn_weights = apply_mask_to_logits(attn_weights, index_mask)
 
     if self.is_partition_in_decode(q_seq_len):
       attn_mask = partitioning.with_sharding_constraint(attn_mask, (KV_LENGTH, HEAD, None, None, None))
@@ -1778,6 +1790,7 @@ class AttentionOp(nnx.Module):
       previous_chunk=None,
       bidirectional_mask=None,
       sinks=None,
+      index_mask: Optional[Array] = None,
       slot: Optional[int] = None,
       page_state: Optional[page_manager.PageState] = None,
   ):
@@ -1800,6 +1813,7 @@ class AttentionOp(nnx.Module):
         previous_chunk=previous_chunk,
         bidirectional_mask=bidirectional_mask,
         sinks=sinks,
+        index_mask=index_mask,
         qk_product_einsum=self.AqtEinsum_0,
         wv_product_einsum=self.AqtEinsum_1,
     )

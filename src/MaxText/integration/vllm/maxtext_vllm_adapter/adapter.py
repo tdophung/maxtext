@@ -21,13 +21,20 @@ from flax import nnx
 import flax.linen as nn
 from jax import numpy as jnp
 from jax.sharding import Mesh
-from MaxText import model_creation_utils
-from MaxText import max_logging
 from MaxText import pyconfig
 from MaxText.common_types import MODEL_MODE_AUTOREGRESSIVE
 from MaxText.globals import MAXTEXT_PKG_DIR
+from maxtext.utils import max_logging
+from maxtext.utils import model_creation_utils
 
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+try:
+  from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+except ImportError:
+  # Mock for documentation build or environments without tpu_inference
+  class AttentionMetadata:
+    input_positions: jax.Array
+
+
 from vllm.config import VllmConfig
 
 

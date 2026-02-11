@@ -206,6 +206,14 @@ wo_tile_dlhs_mlp_dim: 1024
 wo_tile_drhs_batch_seq: 512
 wo_tile_drhs_embed_dim: 1024
 wo_tile_drhs_mlp_dim: 1024
+
+wi_tile_fwd_buffer_count: 2
+wi_tile_dlhs_buffer_count: 2
+wi_tile_drhs_buffer_count: 2
+wo_tile_fwd_buffer_count: 2
+wo_tile_dlhs_buffer_count: 2
+wo_tile_drhs_buffer_count: 2
+
 norm_topk_prob: false # boolean to enable the top-k probability normalization. qwen3-specific normalization of router weights.
 
 # how the expert axis is used to shard attention weights and activations
@@ -215,7 +223,7 @@ expert_shard_attention_option: "fsdp"
 
 # when moe weight matrices are sharded on both fsdp and fsdp-transpose axes, use two separate all-gather calls
 moe_fsdp_use_two_stage_all_gather: false
-# Shard the expert dimension of the MLP weights on the FSDP axis. 
+# Shard the expert dimension of the MLP weights on the FSDP axis.
 # This configuration is recommended only when num_experts is a multiple of fsdp_parallelism
 shard_exp_on_fsdp: False
 # use fsdp and fsdp_transpose axes for sharding the moe weights
@@ -235,6 +243,7 @@ topk_routing_group: -1 # number of top groups to route inputs. For EP,
 # Splits the batch to allow for better scheduling when using expert parallelism by overlapping the
 # all-to-all communication with compute. Currently only implemented with DeepSeek sparse layers.
 use_batch_split_schedule: False # a flag if splitting batch into micro-batches to hide communications that yields performance benefits.
+batch_split_factor: 1 # the factor by which to split the batch. Only used if use_batch_split_schedule is True.
 
 # For complex architectures like llama4 there are repeated sets of
 # inhomogeneous layers. E.g. maverick uses [dense+rope, moe+rope, dense+rope, moe+nope]
@@ -305,6 +314,7 @@ qkv_proj: 'remat'
 out_proj: 'remat'
 mla_q: 'remat'
 mla_kv: 'remat'
+attention_out: 'remat'
 
 optimizer_memory_host_offload: False
 parameter_memory_host_offload: False
@@ -330,6 +340,13 @@ mla_naive_kvcache: True
 moba: False
 moba_chunk_size: 1024
 moba_topk: 8
+
+# DeepSeek Sparse Attention (DSA)
+# deepseek3.2 introduces indexer in MLA
+use_sparse_indexer: False
+index_head_dim: 128
+index_n_heads: 64
+index_topk: 2048
 
 # MLA parameters
 q_lora_rank: 0
@@ -396,6 +413,10 @@ logical_axis_rules: [
                       ['activation_kv_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence']],
                       ['activation_length', ['sequence', 'context', 'expert']],
                       ['activation_length', ['context', 'expert']],
+                      ['activation_attn_length', ['sequence', 'context', 'expert']],
+                      ['activation_attn_length', ['context', 'expert']],
+                      ['activation_attn_length_no_exp', ['sequence', 'context']],
+                      ['activation_attn_length_no_exp', ['context']],
                       ['activation_length_no_exp', ['sequence', 'context']],
                       ['activation_length_no_exp', ['context']],
                       ['activation_norm_length', ['tensor_sequence', 'context', 'sequence']],
@@ -404,6 +425,7 @@ logical_axis_rules: [
                       ['prefill_activation_length', ['sequence', 'context']],
                       ['prefill_activation_norm_length', ['tensor_sequence', 'context', 'sequence']],
                       ['activation_kv_length', []],
+                      ['activation_attn_embed', ['tensor', 'tensor_transpose']],
                       ['activation_embed', ['tensor', 'tensor_transpose']],
                       ['activation_mlp', ['tensor', 'tensor_transpose', 'tensor_sequence']],
                       ['activation_kv', ['tensor', 'tensor_transpose', 'tensor_sequence']],
@@ -446,6 +468,7 @@ logical_axis_rules: [
                       ["kv_lora_up_proj",[]],
                       ['norm', ['tensor', 'tensor_transpose']],
                       ['layers', 'stage'],
+                      ['qkv', []],
                       ['kv', []],
                       ['kv_head_dim', []],
                       ['cache_batch_prefill', []],
@@ -517,7 +540,7 @@ num_vocab_tiling: 1
 
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding
-tokenizer_path: "src/MaxText/assets/tokenizer.llama2"
+tokenizer_path: "src/maxtext/assets/tokenizers/tokenizer.llama2"
 # tfds pipeline supports tokenizer_type: sentencepiece, huggingface, tiktoken
 # grain pipeline supports tokenizer_type: sentencepiece, huggingface
 # hf pipeline only supports huggingface type, and will ignore tokenizer_type flag
@@ -548,7 +571,7 @@ train_image_column: 'image'
 eval_data_columns: ['text'] # for DPO dataset containing "chosen" and "rejected"
 eval_image_column: 'image'
 packing: True
-num_epoch: 1  # only grain and tfds pipeline supports num_epoch > 1
+num_epoch: 1
 generate_padding_batch_train: False
 generate_padding_batch_eval: False
 # Maximum number of segments that can be packed into a single sequence
@@ -694,7 +717,7 @@ profile_periodically_period: -1 # If set to a positive integer, profile every pr
 managed_mldiagnostics: False # Whether to enable the managed diagnostics
 managed_mldiagnostics_run_group: ""  # Optional. Used to group multiple runs.
 
-# Dump HLO options
+# Dump HLO and jaxpr options
 dump_hlo: False
 dump_step: -1 # Dump modules at the given step if set to a positive integer.
 dump_hlo_local_dir: "/tmp/xla_dump/"
@@ -706,6 +729,10 @@ dump_hlo_xla_flags: "" # Defaults to "--xla_dump_to={dump_hlo_local_dir} --xla_d
 dump_hlo_upload_all: False # If true all hosts dump HLO, false only jax.process_index()==0
 # All hosts should have identical HLO for SPMD programs, however we have encountered some bugs
 # where this is not the case and it is helpful to compare HLO across hosts.
+dump_jaxpr: False
+dump_jaxpr_local_dir: "/tmp/jaxpr_dump/"
+dump_jaxpr_delete_local_after: True
+dump_jaxpr_gcs_dir: "" # Defaults to {base_output_directory}/{run_name}/jaxpr_dump
 
 # When dropout is false the model is a deterministic function of the
 # data_shuffle_seed and init_weights_seed (i.e. reproducible losses)
@@ -895,6 +922,7 @@ use_max_logit_estimate: -1 # -1 means no estimate, any > 0 value will be used as
 cost_estimate_flops_fwd: -1 # -1 means using splash default cost estmiation, any >= 0 value will be used as cost estmiation for splash to overlap for communication (forward)
 cost_estimate_flops_bwd: -1 # -1 means using splash default cost estmiation, any >= 0 value will be used as cost estmiation for splash to overlap for communication (backward)
 dq_reduction_steps: 0 #the number of reduction steps. For now, only 3 or all the kv steps are supported.
+use_splash_scheduler: False # to use tokamax splash attention scheduler.
 ### Determine if we want to use load balance for context parallelism
 context_parallel_load_balance: True
 context_parallel_strategy: "all_gather" # "all_gather" or "ring"
@@ -940,7 +968,9 @@ temperature_tuning: False
 
 # Multimodal flags
 use_multimodal: False
+use_audio: False
 freeze_vision_encoder_params: True
+freeze_audio_encoder_params: True
 dtype_mm: "float32"  # Data type for multimodal model's vision encoder
 remat_policy_for_vit: "minimal"  # Remat policy for multimodal model's vision encoder. Check `remat_policy` for options.
 image_size_for_vit: 896 # Default for Gemma3, and should be overwritten by model's config
@@ -978,6 +1008,30 @@ temporal_patch_size_for_vit: 2
 num_position_embeddings_for_vit: 1024
 deepstack_visual_indexes_for_vit: []
 
+### Audio encoder configs (Qwen3-OmniMoe)
+d_model_for_audio: 256
+encoder_attention_heads_for_audio: 4
+encoder_ffn_dim_for_audio: 512
+encoder_layers_for_audio: 2
+attention_dropout_for_audio: 0.0
+activation_dropout_for_audio: 0.0
+activation_function_for_audio: "gelu"
+num_mel_bins_for_audio: 128
+max_source_positions_for_audio: 1500
+scale_embedding_for_audio: True
+n_window_for_audio: 50
+n_window_infer_for_audio: 800
+conv_chunksize_for_audio: 500
+downsample_hidden_size_for_audio: 256
+output_dim_for_audio: 512
+num_conv_layers_for_audio: 3
+max_timescale_for_audio: 10000.0
+max_sample_len_for_audio: 10000
+
+use_mrope: false
+mrope_section: [24, 20, 20]
+position_id_per_seconds: 25
+
 # Subslice shape in the form of "x,y,z" when using pathways (single controller).
 # Example: "8,8" to use a 8x8 subgrid (64 chips) of a full pod (16x16) of trillium.
 subslice_shape: ""
@@ -1014,3 +1068,11 @@ use_jax_splash: false
 vllm_hf_config_path: ""
 # JSON string containing additional configuration for the vLLM model (e.g. '{"maxtext_config": {...}}')
 vllm_additional_config: {}
+# When use_jax_splash=True, force the layout of the query tensor to be [..., NUM_HEADS, HEAD_DIM, SEQ_LENGTH]
+force_q_layout: false
+
+################################## DeepSeek Manifold-Constrained Hyper Connections (mHC) ##################################
+# The number of parallel streams in Hyper Connection.
+mhc_expansion_rate: 0
+# The number of iterations for the Sinkhorn-Knopp algorithm.
+sinkhorn_iterations: 20
