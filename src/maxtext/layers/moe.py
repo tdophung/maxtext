@@ -872,8 +872,12 @@ class RoutedMoE(nnx.Module):
 
     raw_logits_2d = gate_logits.reshape(num_tokens, -1)
 
-    # ---- Launch both kernels before consuming either's output ----
-    # Main routing: score_func -> [bias] -> top-k -> [post-softmax] -> scale
+    router_dtype = jnp.float32 if self.config.logits_dot_in_fp32 else self.dtype
+    raw_logits_2d = raw_logits_2d.astype(router_dtype)
+    expert_bias_for_te = None
+    if gate_expert_bias is not None and gate_expert_bias.size > 0:
+      expert_bias_for_te = gate_expert_bias.astype(router_dtype)
+
     sparse_probs, routing_map = te_router.te_fused_topk(
         raw_logits_2d,
         topk=self.num_experts_per_tok,
@@ -882,8 +886,11 @@ class RoutedMoE(nnx.Module):
         num_groups=self.config.n_routing_groups,
         group_topk=self.config.topk_routing_group,
         scaling_factor=self.config.routed_scaling_factor,
-        expert_bias=gate_expert_bias if gate_expert_bias is not None and gate_expert_bias.size > 0 else None,
+        expert_bias=expert_bias_for_te,
     )
+
+    sparse_probs = sparse_probs.astype(self.dtype)
+
     # Aux scoring: score_func -> top-k (clean — no bias/groups/scaling)
     aux_scores, aux_routing_map = None, None
     if self.config.load_balance_loss_weight > 0.0:
@@ -904,6 +911,7 @@ class RoutedMoE(nnx.Module):
           topk=self.num_experts_per_tok,
           coeff=self.config.load_balance_loss_weight,
       )
+      aux_scores = aux_scores.astype(self.dtype)
 
     # Bias updates use the main routing_map (actual load after bias).
     bias_updates = None
@@ -1003,6 +1011,7 @@ class RoutedMoE(nnx.Module):
       x, perm_state.row_id_map, group_sizes, perm_state.dense_probs, perm_state.pad_offsets = (
           self._te_permute(inputs, routing_map, dense_probs)
       )
+
       expert_indices = jnp.arange(self.num_experts)
       selected_experts = jnp.repeat(
           expert_indices, repeats=group_sizes, total_repeat_length=x.shape[0],
