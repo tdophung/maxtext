@@ -730,7 +730,6 @@ class RoutedMoE(nnx.Module):
         bias_updates,
     )
 
-<<<<<<< HEAD
   def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None):
     """TE routing + permutation. Delegates to te_permutation.te_permute()."""
     return te_permutation.te_permute(
@@ -752,127 +751,6 @@ class RoutedMoE(nnx.Module):
         roll_to_expert_id=roll_to_expert_id,
     )
 
-=======
-  def _te_permute(
-      self,
-      inputs: jax.Array,
-      gate_logits: jax.Array,
-      gate_expert_bias: Optional[jax.Array],
-      rngs=None,
-      roll_to_expert_id=None,
-      num_experts_per_shard: Optional[int] = None,
-  ) -> Tuple[jax.Array, jax.Array, jax.Array, Optional[jax.Array], Optional[jax.Array], jax.Array, Optional[jax.Array]]:
-    """TE routing + permutation: fused router then TE token dispatch.
-
-    Combines TE's fused router (score_function + top-k + bias + scaling)
-    with TE's optimized permutation kernels into a single step.
-
-    The main routing kernel and aux scoring kernel are logically independent
-    (both read only from raw_logits_2d with no data dependency between them),
-    so XLA can overlap their GPU execution automatically.
-
-    Args:
-      inputs: Input tensor of shape [batch, seq, hidden].
-      gate_logits: Raw GEMM logits [batch, seq, num_experts] (no score_func/bias).
-      gate_expert_bias: Expert bias [num_experts] or empty array [0].
-      rngs: Random number generators (unused, kept for signature compatibility).
-      roll_to_expert_id: Expert ID offset for ring-of-experts.
-
-    Returns:
-      Tuple of:
-        - permuted_outputs: Tokens grouped by expert [num_out_tokens, hidden].
-        - row_id_map: Mapping for unpermute phase.
-        - tokens_per_expert: Token counts per expert [num_experts].
-        - lb_loss: Scalar load balance loss (or None).
-        - bias_updates: Bias update direction [num_experts] (or None).
-        - dense_probs: Dense routing probs [num_tokens, num_experts] for combine.
-        - pad_offsets: Padding offsets per expert (or None).
-    """
-    te_router.check_te_router_available()
-    te_permutation.check_te_permutation_available()
-
-    hidden_size = inputs.shape[-1]
-    num_tokens = inputs.shape[0] * inputs.shape[1]
-    num_out_tokens = num_tokens * self.num_experts_per_tok
-
-    # --- TE Router ---
-    raw_logits_2d = gate_logits.reshape(num_tokens, -1)
-
-    router_dtype = jnp.float32 if self.config.logits_dot_in_fp32 else self.dtype
-    raw_logits_2d = raw_logits_2d.astype(router_dtype)
-    expert_bias_for_te = None
-    if gate_expert_bias is not None and gate_expert_bias.size > 0:
-      expert_bias_for_te = gate_expert_bias.astype(router_dtype)
-
-    sparse_probs, routing_map = te_router.te_fused_topk(
-        raw_logits_2d,
-        topk=self.num_experts_per_tok,
-        score_function=self.config.routed_score_func,
-        use_pre_softmax=False,
-        num_groups=self.config.n_routing_groups,
-        group_topk=self.config.topk_routing_group,
-        scaling_factor=self.config.routed_scaling_factor,
-        expert_bias=expert_bias_for_te,
-    )
-
-    sparse_probs = sparse_probs.astype(self.dtype)
-
-    aux_scores, aux_routing_map = None, None
-    if self.config.load_balance_loss_weight > 0.0:
-      aux_scores, aux_routing_map = te_router.te_compute_aux_scores(
-          raw_logits_2d,
-          topk=self.num_experts_per_tok,
-          score_function=self.config.routed_score_func,
-      )
-
-    lb_loss = None
-    if self.config.load_balance_loss_weight > 0.0:
-      aux_tokens_per_expert = jnp.sum(aux_routing_map.astype(jnp.int32), axis=0)
-      lb_loss = te_router.te_aux_loss(
-          aux_scores, aux_tokens_per_expert,
-          topk=self.num_experts_per_tok,
-          coeff=self.config.load_balance_loss_weight,
-      )
-      aux_scores = aux_scores.astype(self.dtype)
-
-    bias_updates = None
-    if self.should_update_load_balance():
-      main_tokens_per_expert = jnp.sum(routing_map.astype(jnp.int32), axis=0)
-      total_assignments = num_tokens * self.num_experts_per_tok
-      average_load = total_assignments / self.num_experts
-      direction = jnp.sign(average_load - main_tokens_per_expert)
-      bias_updates = direction * self.config.routed_bias_update_rate
-
-    if roll_to_expert_id is not None:
-      routing_map = jnp.roll(routing_map, -roll_to_expert_id, axis=-1)
-      sparse_probs = jnp.roll(sparse_probs, -roll_to_expert_id, axis=-1)
-      if num_experts_per_shard is not None:
-        local_expert_mask = (jnp.arange(self.num_experts) < num_experts_per_shard)
-        routing_map = routing_map * local_expert_mask[None, :]
-        sparse_probs = sparse_probs * local_expert_mask[None, :].astype(sparse_probs.dtype)
-
-    # --- TE Permutation ---
-    # In ring-of-experts mode, disable padding alignment: the permuted tokens
-    # are masked to local experts only, so padding inflates the buffer through
-    # all 3 GEMMs and their transposes, causing XLA to pick slower GEMM tilings.
-    if roll_to_expert_id is not None:
-      align_size = None
-    else:
-      align_size = self.config.te_permutation_align_size
-      if align_size == 0:
-        align_size = None
-
-    permuted_outputs, _permuted_probs, row_id_map, pad_offsets, tokens_per_expert = te_permutation.te_token_dispatch(
-        inputs.reshape(-1, hidden_size),
-        routing_map,
-        num_out_tokens=num_out_tokens,
-        probs=sparse_probs,
-        align_size=align_size,
-    )
-
-    return permuted_outputs, row_id_map, tokens_per_expert, lb_loss, bias_updates, sparse_probs, pad_offsets
-
->>>>>>> f903e170 (profiling set up with some optimizatiobn as described in te_moe_optimization_summary/md)
   def _te_unpermute(
       self, expert_outputs, row_id_map, batch_size, sequence_length,
       dense_probs=None, pad_offsets=None,
