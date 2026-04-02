@@ -730,7 +730,8 @@ class RoutedMoE(nnx.Module):
         bias_updates,
     )
 
-  def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None):
+  def _te_permute(self, inputs, gate_logits, gate_expert_bias, rngs=None, roll_to_expert_id=None,
+                   num_experts_per_shard=None):
     """TE routing + permutation. Delegates to te_permutation.te_permute()."""
     return te_permutation.te_permute(
         inputs,
@@ -749,6 +750,7 @@ class RoutedMoE(nnx.Module):
         routed_bias_update_rate=self.config.routed_bias_update_rate,
         te_permutation_align_size=self.config.te_permutation_align_size,
         roll_to_expert_id=roll_to_expert_id,
+        num_experts_per_shard=num_experts_per_shard,
     )
 
   def _te_unpermute(
@@ -1282,7 +1284,7 @@ class RoutedMoE(nnx.Module):
             assert self.config.quantization and self.config.quantization.startswith("te_"), "TE GMM currently requires TE quantization."
             # TODO(jberchtold): Adjust this based on TE GMM requirements per recipe
             TE_GMM_ALIGN_REQUIREMENT = 128
-            assert self.config.te_permutation_impl and self.config.te_permutation_align_size % TE_GMM_ALIGN_REQUIREMENT == 0 and self.config.te_permutation_align_size > 0, f"TE GMM currently requires TE permutation with alignment (te_permutation_align_size > 0 and multiple of {TE_GMM_ALIGN_REQUIREMENT})."
+            assert self.config.te_router_and_permutation_impl and self.config.te_permutation_align_size % TE_GMM_ALIGN_REQUIREMENT == 0 and self.config.te_permutation_align_size > 0, f"TE GMM currently requires TE permutation with alignment (te_permutation_align_size > 0 and multiple of {TE_GMM_ALIGN_REQUIREMENT})."
             return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
 
       pad_length = self.config.wi_tile_fwd_batch_seq
@@ -1499,7 +1501,7 @@ class RoutedMoE(nnx.Module):
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
 
-        use_te = getattr(self.config, "te_permutation_impl", False) and te_permutation.TE_PERMUTATION_AVAILABLE and te_router.TE_ROUTER_AVAILABLE
+        use_te = self.config.te_router_and_permutation_impl and te_permutation.TE_PERMUTATION_AVAILABLE and te_router.TE_ROUTER_AVAILABLE
 
         # Duplicate inputs to all expert shards.
         # TE path does not use pre_bias_logits, so skip its allgather

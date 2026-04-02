@@ -1,14 +1,21 @@
 #!/bin/bash
 # Launch xprof for each profile run in xprof_profiles/, each on a distinct port.
+# Auto-discovered runs are sorted by profile capture timestamp (chronological),
+# so port assignment matches the order the profiles were collected.
+#
 # Usage:
 #   bash start_xprof.sh              # auto-discover all runs
 #   bash start_xprof.sh te_impl_ring # only specific run(s)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/xprof_profiles}"
+PROFILE_DIR="${PROFILE_DIR:-${SCRIPT_DIR}/xprof_profiles_deepseek_1gpu}"
 BASE_PORT="${BASE_PORT:-8791}"
 
-# Count how many profile dirs we'll use so we can clean up the right port range.
+# Return the earliest profile timestamp dir name for a tensorboard/ path.
+_profile_timestamp() {
+    ls -1 "$1/plugins/profile/" 2>/dev/null | sort | head -1
+}
+
 if [[ $# -gt 0 ]]; then
     dirs=()
     for name in "$@"; do
@@ -20,10 +27,21 @@ if [[ $# -gt 0 ]]; then
         fi
     done
 else
-    dirs=()
+    # Collect tensorboard dirs sorted by profile capture timestamp so that
+    # port assignment matches the chronological profiling order.
+    unsorted=()
     for d in "${PROFILE_DIR}"/*/tensorboard/; do
-        [[ -d "$d" ]] && dirs+=("$d")
+        [[ -d "$d" ]] && unsorted+=("$d")
     done
+    dirs=()
+    while IFS= read -r line; do
+        dirs+=("${line#* }")
+    done < <(
+        for d in "${unsorted[@]}"; do
+            ts=$(_profile_timestamp "$d")
+            echo "${ts:-zzz} ${d}"
+        done | sort
+    )
 fi
 
 if [[ ${#dirs[@]} -eq 0 ]]; then
