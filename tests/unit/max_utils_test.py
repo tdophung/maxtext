@@ -369,6 +369,17 @@ class TestTeMoeRecvCapacity(unittest.TestCase):
 
     self.assertEqual(recv_capacity, 512)
 
+  def test_cutedsl_uses_256_alignment(self):
+    recv_capacity = max_utils._te_moe_recv_capacity_per_rank(
+        ep_size=2,
+        max_tokens_per_rank=65,
+        num_experts_per_tok=2,
+        num_local_experts=4,
+        alignment=256,
+    )
+
+    self.assertEqual(recv_capacity, 1024)
+
 
 if __name__ == "__main__":
   unittest.main()

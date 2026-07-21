@@ -2554,6 +2554,8 @@ class RoutedMoE(nnx.Module):
       out_sharding: NamedSharding | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
+    max_utils.configure_te_moe_cutedsl_fusion(self.config)
+
     try:
       from transformer_engine.jax import moe as te_moe  # pylint: disable=import-outside-toplevel
     except ImportError as exc:

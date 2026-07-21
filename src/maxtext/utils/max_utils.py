@@ -1150,6 +1150,23 @@ def transformer_engine_context():
 _te_moe_bootstrap_signature = None
 
 
+_TE_MOE_CUTEDSL_ENV = "NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION"
+_TE_MOE_DEFAULT_ALIGN_SIZE = 128
+_TE_MOE_CUTEDSL_ALIGN_SIZE = 256
+
+
+def configure_te_moe_cutedsl_fusion(config):
+  """Apply MaxText's TE MoE CuTeDSL opt-in to TransformerEngine's env flag."""
+  if getattr(config, "te_moe_cutedsl_fusion", False):
+    os.environ[_TE_MOE_CUTEDSL_ENV] = "1"
+
+
+def te_moe_cutedsl_fusion_enabled(config) -> bool:
+  """Return whether TE MoE should use the CuTeDSL alignment contract."""
+  configure_te_moe_cutedsl_fusion(config)
+  return os.environ.get(_TE_MOE_CUTEDSL_ENV, "0") == "1"
+
+
 def _te_moe_recv_capacity_per_rank(ep_size, max_tokens_per_rank, num_experts_per_tok, num_local_experts, alignment):
   """Mirror TE MoE's worst-case aligned receive-capacity bound."""
   tokens_per_ep_group = ep_size * max_tokens_per_rank
@@ -1176,6 +1193,8 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         "`test-maxtext.sh --multiprocess` or an equivalent one-GPU-per-process launcher."
     )
 
+  configure_te_moe_cutedsl_fusion(config)
+
   try:
     from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
     from transformer_engine.jax.moe import (  # pylint: disable=import-outside-toplevel
@@ -1196,7 +1215,11 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
-  effective_align = max(int(config.moe_permutation_group_align_size), 128)
+  effective_align = (
+      _TE_MOE_CUTEDSL_ALIGN_SIZE
+      if te_moe_cutedsl_fusion_enabled(config)
+      else max(int(config.moe_permutation_group_align_size), _TE_MOE_DEFAULT_ALIGN_SIZE)
+  )
   max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
   recv_capacity_per_rank = _te_moe_recv_capacity_per_rank(
       ep_size,
@@ -1230,7 +1253,8 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         "Bootstrapping TE MoE EP: "
         f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
-        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim}"
+        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
+        f"align={effective_align} cutedsl={te_moe_cutedsl_fusion_enabled(config)}"
     )
     ep_bootstrap(
         world_size=jax.process_count(),
